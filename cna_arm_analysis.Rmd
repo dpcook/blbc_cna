@@ -1,0 +1,416 @@
+---
+title: "CNV analysis"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(SCpubr)
+```
+
+# Load infercnvpy output
+```{r}
+cnv_calls <- read.delim(gzfile("~/Projects/tnbc_cna/output/infercnvpy_matrix.txt.gz"),
+                        sep="\t", header=F)
+cnv_calls <- as.matrix(cnv_calls)
+#rows = cells, cols = genomic bins
+```
+
+# Calculate % Genome Altered
+```{r}
+meta <- read.csv("~/Projects/tnbc_cna/output/infercnvpy_cell_metadata.csv",
+                 row.names=1)
+df_nonmalignant <- cnv_calls %>%
+  as.data.frame() %>%
+  mutate(celltype_pred = meta$celltype_pred) %>%
+  filter(celltype_pred != "Epithelial") %>% # remove malignant cells
+  filter(celltype_pred != "Mast") %>% #remove mast.  artifactually high cna inference
+  pivot_longer(-celltype_pred, names_to="Bin", values_to="Value") %>%
+  group_by(Bin) %>%
+  summarize(mean = mean(Value), sd = sd(Value)) %>%
+  mutate(upper_thresh = mean + 2*sd, #Threshold = mean +/- 2SD
+         lower_thresh = mean - 2*sd)
+
+
+df_malignant <- cnv_calls %>%
+  as.data.frame() %>%
+  mutate(leiden = meta$leiden,
+         cell_id = rownames(meta)) %>%
+  filter(leiden %in% c(0, 6)) %>%
+  column_to_rownames(var="cell_id")
+df_malignant$celltype_pred <- NULL
+df_malignant <- as.matrix(df_malignant)
+
+df_malignant <- df_malignant[,df_nonmalignant$Bin]
+
+altered <- list()
+for(i in 1:ncol(df_malignant)){
+  altered[[i]] <- (df_malignant[,i] > df_nonmalignant$upper_thresh[i]) |
+    (df_malignant[,i] < df_nonmalignant$lower_thresh[i])
+}
+
+altered <- do.call(cbind, altered)
+
+fga <- rowSums(altered) / ncol(altered)
+```
+
+Export data
+```{r}
+#export for khalid
+pam50 <- read.csv("../output/pam50_subtype_annotations.csv", row.names=1)
+fga_df <- data.frame(cell = names(fga), 
+                     fga = fga,
+                     sample_id = meta[names(fga), "sample_id"],
+                     subtype = meta[names(fga), "subtype"])
+fga_df$pam50 <- pam50$pam50_subtype[match(fga_df$sample_id, rownames(pam50))]
+
+# summarize by patient
+fga_df <- fga_df %>%
+  group_by(sample_id, subtype, pam50) %>%
+  summarize(fga = mean(fga))
+write.csv(fga_df, file="../output/fga_summary.csv", row.names = F)
+```
+
+```{r}
+fga_df$tmp <- ifelse(fga_df$pam50 == "BLBC", "Yes", "No")
+summary(lm(fga_df$fga ~ fga_df$tmp))
+```
+
+
+# Aggregate by chromosome arm
+```{r}
+arm_locs <- human_chr_locations #loaded with package. based on GRCh38, just like locations in var
+
+arms <- arm_locs %>% filter(arm=='q') #has proper end
+arms <- arms %>% filter( chr != "Y")
+arms$rel_p_length <- arms$start / arms$end
+
+#This is based on the specific number of bins per chromosome from the infercnvpy output
+chr_bins <- data.frame(
+  chr = c(paste0("chr", 1:22), "chrX"),
+  start = c(0, 152, 252, 337, 392, 459, 533, 603, 654, 712, 769, 854, 933, 960,
+            1011, 1057, 1123, 1210, 1211, 1323, 1363, 1364, 1401)
+)
+
+chr_bins$start <- chr_bins$start + 1 #adjust 0-based to 1-based count
+chr_bins$end <- c((chr_bins$start[2:nrow(chr_bins)]-1), 1451)
+
+chr_bins$length <- c(chr_bins$start[2:nrow(chr_bins)], 1451) - chr_bins$start
+
+chr_bins$q_start <- chr_bins$start + ((chr_bins$end - chr_bins$start) * arms$rel_p_length)
+chr_bins$q_start <- round(chr_bins$q_start)
+
+head(chr_bins)
+```
+
+
+```{r}
+chr_order <- rep(chr_bins$chr, each = 2)
+chr_order <- paste0(chr_order, c("_p", "_q"))
+
+cnv_list <- list()
+#Get average CNV signal for all bins within arm range
+for(i in 1:nrow(chr_bins)){
+  print(chr_bins$chr[i])
+  if(chr_bins$length[i] > 1){
+    p_vals <- rowMeans(cnv_calls[,chr_bins$start[i]:chr_bins$q_start[i]])
+    q_vals <- rowMeans(cnv_calls[,chr_bins$q_start[i]:chr_bins$end[i]])
+  } else{
+    p_vals <- cnv_calls[,chr_bins$start[i]]
+    q_vals <- cnv_calls[,chr_bins$start[i]]
+  }
+  
+  cnv_list[[i]] <- data.frame(p = p_vals, q=q_vals)
+  colnames(cnv_list[[i]]) <- paste0(chr_bins$chr[i], c("p", "q"))
+}
+
+cnv_list <- do.call('cbind', cnv_list)
+cnv_list <- as.matrix(cnv_list)
+cnv_list[cnv_list > 0.1] <- 0.1
+cnv_list[cnv_list < -0.1] <- -0.1
+```
+
+```{r}
+#Arm-level quantifications for all cells in the dataset
+write.table(cnv_list, file="~/Projects/tnbc_cna/output/infercnvpy_matrix_arm_binned.csv", 
+          col.names = F, row.names = F, quote = F, sep=",")
+```
+
+# Load cell metadata
+```{r}
+meta <- read.csv("~/Projects/tnbc_cna/output/infercnvpy_cell_metadata.csv",
+                 row.names=1)
+#We'll also add pam50 annotations, which were present when we ran inferCNVpy
+pam50_anno <- read.csv("~/Projects/tnbc_cna/output/pam50_subtype_annotations.csv",
+                       row.names=1)
+meta$pam50_subtype <- pam50_anno$pam50_subtype[match(meta$sample_id, rownames(pam50_anno))]
+#write.csv(meta, file="~/Projects/tnbc_cna/output/infercnvpy_cell_metadata_withPAM50.csv",
+#          row.names=F)
+
+cnv_list <- read.csv("~/Projects/tnbc_cna/output/infercnvpy_matrix_arm_binned.csv",
+                     header = F)
+colnames(cnv_list) <- paste0(rep(chr_bins$chr, each=2), "_", c("p", "q"))
+rownames(cnv_list) <- rownames(meta)
+```
+
+```{r}
+table(rownames(cnv_list) == rownames(meta))
+head(cnv_list)
+```
+
+# CNV calls
+We'll define thresholds for each arm based on the signal in non-malignant cells
+For each arm, first calculate the average for each cell type, then take average of all of those. This ensures it is not as affected by cell count per cell type
+
+ 
+```{r}
+nonmalignant_values <- cnv_list %>%
+  mutate(celltype_pred = meta$celltype_pred, # Add cell type information
+         sample_id = meta$sample_id) %>%
+  pivot_longer(-c(celltype_pred, sample_id), names_to="Arm", #Tidy
+               values_to="CNA") %>%
+  filter(celltype_pred != "Epithelial") %>% # remove malignant cells
+  filter(celltype_pred != "Mast") %>% #remove mast. seems to have artifactually high cna inference
+  group_by(celltype_pred, Arm) %>%
+  summarize(CNA_mean = mean(CNA), CNA_SD = sd(CNA)) %>% # mean and sd of CNA signal per cell type
+  ungroup() %>% group_by(Arm) %>%
+  summarize(CNA_SD = mean(CNA_SD), CNA_mean = mean(CNA_mean)) %>% #average of those mean and SD values
+  mutate(upper_thresh = CNA_mean + 1*CNA_SD, #Threshold = mean +/- 2SD
+         lower_thresh = CNA_mean - 1*CNA_SD)
+
+
+# Match order w/ cnv_list
+nonmalignant_values <- nonmalignant_values[match(colnames(cnv_list), nonmalignant_values$Arm),]
+```
+
+## Per cell
+```{r}
+cnv_calls <- list()
+for(i in 1:ncol(cnv_list)){
+  values = cnv_list[,i]
+  calls <- rep(0, length(values))
+  calls[values > nonmalignant_values$upper_thresh[i]] <- 1
+  calls[values < nonmalignant_values$lower_thresh[i]] <- -1
+  cnv_calls[[i]] <- calls
+}
+
+cnv_calls <- do.call('cbind', cnv_calls)
+rownames(cnv_calls) <- rownames(cnv_list)
+colnames(cnv_calls) <- colnames(cnv_list)
+```
+
+# Clonality of mutations
+Subset to epithelial only, group by patient, count proportion of cells w/ alteration in each arm
+```{r}
+clonality <- cnv_calls %>%
+  as.data.frame() %>%
+  mutate(sample_id = meta$sample_id, 
+         pam50 = meta$pam50_subtype,
+         celltype_pred = meta$celltype_pred) %>%
+  filter(celltype_pred == "Epithelial") %>%
+  pivot_longer(-c("sample_id", "pam50", "celltype_pred"), 
+               names_to = "Arm", values_to = "CNA") %>%
+  group_by(sample_id, pam50, Arm) %>%
+  summarize(Gain_sum = sum(CNA==1),
+            Loss_sum = sum(CNA == -1),
+            Gain_prop = Gain_sum / n(),
+            Loss_prop = Loss_sum / n(),
+            Cell_count = n())
+
+write.csv(clonality, file="../output/cnv_clonality.csv", row.names=F)
+clonality <- read.csv("../output/cnv_clonality.csv")
+head(clonality) # Per sample, number of cells with alteration (gain or loss) in a given arm
+```
+
+Make it so each Arm entry specifies gain or loss (eg. chr10_p_gain)
+```{r}
+chr_remove <- c("chrX_p", "chrX_q", "chr13_p", 
+                "chr14_p", "chr15_p", "chr21_p", "chr22_p")
+clonality <- filter(clonality, Arm %nin% chr_remove)
+
+df_gain <- clonality
+df_gain$Arm <- paste0(df_gain$Arm, "_gain")
+df_gain$Prop <- df_gain$Gain_prop
+
+df_loss <- clonality
+df_loss$Arm <- paste0(df_loss$Arm, "_loss")
+df_loss$Prop <- df_loss$Loss_prop
+
+clonality <- rbind(df_gain, df_loss)
+```
+
+
+Plot clonality of alterations
+```{r}
+cols <- RColorBrewer::brewer.pal(9, "BuPu")
+```
+
+##Plot
+```{r}
+plotClonality <- function(subtype){
+  df <- clonality %>% filter(pam50 == subtype)
+  
+  tumor_count <- length(unique(df$sample_id))
+  
+  #Count alterations
+  df$clonality <- "Not altered"
+  
+  df$clonality[df$Prop > 0.1 & df$Prop < 0.5] <- "Subclonal"
+  df$clonality[df$Prop > 0.5] <- "Clonal"
+  
+  # Get arm ranking
+  counts <- table(df$Arm, df$clonality)
+  chr_order <- rownames(counts)[order(counts[,"Clonal"])]
+  df$Arm  <- factor(df$Arm, levels = rev(chr_order))
+  
+  df$clonality <- factor(df$clonality, levels = c("Not altered", "Subclonal", "Clonal"))
+  
+  p <- ggplot(df, aes(x=Arm, fill=clonality)) +
+    geom_bar(position="fill") +
+    ggtitle(paste0("Arm alteration: ", 
+                   subtype, " (", tumor_count, " patients)")) +
+    scale_y_continuous(expand=c(0,0)) +
+    scale_fill_manual(values=c(cols[2], cols[4], cols[8]),
+                      name="") +
+    xlab("") + ylab("Proportion of samples") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=45, hjust=1, 
+                                     color="black", size=6),
+          axis.text.y = element_text(color="black"))
+  return(p)
+}
+```
+
+```{r}
+ggsave(plotClonality("BLBC"),
+       filename="../figs/CNBA_clonality_BLBC.pdf",
+       width=12, height=3)
+
+ggsave(plotClonality("ER.A"),
+       filename="../figs/CNBA_clonality_ERA.pdf",
+       width=12, height=3)
+
+ggsave(plotClonality("ER.B"),
+       filename="../figs/CNBA_clonality_ERB.pdf",
+       width=12, height=3)
+
+ggsave(plotClonality("HER2"),
+       filename="../figs/CNBA_clonality_HER2.pdf",
+       width=12, height=3)
+
+ggsave(plotClonality("Normal.CL"),
+       filename="../figs/CNBA_clonality_NormalCL.pdf",
+       width=12, height=3)
+```
+
+
+## Previous version split by gains and losses
+```{r}
+plotClonality <- function(subtype, alteration){
+  df <- clonality %>% filter(pam50 == subtype)
+  
+  tumor_count <- length(unique(df$sample_id))
+  
+  #Count alterations
+  df$clonality <- "Not altered"
+  
+  if(alteration == "Gain"){
+    df$clonality[df$Gain_prop > 0.1 & df$Gain_prop < 0.5] <- "Subclonal"
+    df$clonality[df$Gain_prop > 0.5] <- "Clonal"
+  } else if(alteration == "Loss"){
+    df$clonality[df$Loss_prop > 0.1 & df$Loss_prop < 0.5] <- "Subclonal"
+    df$clonality[df$Loss_prop > 0.5] <- "Clonal"
+  }
+  
+  # Get arm ranking
+  counts <- table(df$Arm, df$clonality)
+  chr_order <- rownames(counts)[order(counts[,"Clonal"])]
+  df$Arm  <- factor(df$Arm, levels = rev(chr_order))
+  
+  df$clonality <- factor(df$clonality, levels = c("Not altered", "Subclonal", "Clonal"))
+  
+  p <- ggplot(df, aes(x=Arm, fill=clonality)) +
+    geom_bar(position="fill") +
+    ggtitle(paste0("Arm ", alteration, ": ", 
+                   subtype, " (", tumor_count, " patients)")) +
+    scale_y_continuous(expand=c(0,0)) +
+    scale_fill_manual(values=c(cols[2], cols[4], cols[8]),
+                      name="") +
+    xlab("") + ylab("Proportion of samples") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=45, hjust=1, color="black"),
+          axis.text.y = element_text(color="black"))
+  return(p)
+}
+```
+
+```{r}
+p1 <- plotClonality("BLBC", "Gain")
+p2 <- plotClonality("BLBC", "Loss")
+clonality_plot <- cowplot::plot_grid(p1, p2,  ncol=1, align='v')
+cowplot::save_plot(clonality_plot,
+                   filename="../figs/CNA_clonality_BLBC.pdf",
+                   base_width=10, base_height=4.5)
+
+p1 <- plotClonality("HER2", "Gain")
+p2 <- plotClonality("HER2", "Loss")
+clonality_plot <- cowplot::plot_grid(p1, p2,  ncol=1, align='v')
+cowplot::save_plot(clonality_plot,
+                   filename="../figs/CNA_clonality_HER2.pdf",
+                   base_width=10, base_height=4.5)
+
+p1 <- plotClonality("ER.A", "Gain")
+p2 <- plotClonality("ER.A", "Loss")
+clonality_plot <- cowplot::plot_grid(p1, p2,  ncol=1, align='v')
+cowplot::save_plot(clonality_plot,
+                   filename="../figs/CNA_clonality_ER.A.pdf",
+                   base_width=10, base_height=4.5)
+
+p1 <- plotClonality("ER.B", "Gain")
+p2 <- plotClonality("ER.B", "Loss")
+clonality_plot <- cowplot::plot_grid(p1, p2,  ncol=1, align='v')
+cowplot::save_plot(clonality_plot,
+                   filename="../figs/CNA_clonality_ER.B.pdf",
+                   base_width=10, base_height=4.5)
+
+p1 <- plotClonality("Normal.CL", "Gain")
+p2 <- plotClonality("Normal.CL", "Loss")
+clonality_plot <- cowplot::plot_grid(p1, p2,  ncol=1, align='v')
+cowplot::save_plot(clonality_plot,
+                   filename="../figs/CNA_clonality_Normal.CL.pdf",
+                   base_width=10, base_height=4.5)
+```
+
+# Mean-variance clonality
+The relationship between the arm's mean CNA call and variance should tell us about clonality
+High mean, low variance = clonal
+high mean, high variance = subclone
+low mean, low variance = not altered
+
+Will first try just summarizing this at the level of subtypes
+```{r}
+mean_var <- cnv_list %>%
+  mutate(celltype_pred = meta$celltype_pred, # Add cell type information
+         sample_id = meta$sample_id,
+         pam50 = meta$pam50_subtype) %>%
+  filter(celltype_pred == "Epithelial") %>%
+  pivot_longer(-c(celltype_pred, sample_id, pam50), names_to="Arm", #Tidy
+               values_to="CNA") %>%
+  group_by(pam50, sample_id, Arm) %>%
+  summarize(CNA_mean = mean(CNA), CNA_var = var(CNA)) %>%
+  ungroup() %>% group_by(pam50, Arm) %>%
+  summarize(CNA_mean = mean(CNA_mean), CNA_var = mean(CNA_var))
+```
+
+```{r}
+var_plot <- ggplot(mean_var %>% filter(pam50 == "BLBC"), 
+                   aes(x=CNA_mean, y=CNA_var, label=Arm)) +
+  geom_point() +
+  geom_label_repel(size = 2) +
+  theme_classic()
+```
+
+
+
+
+
